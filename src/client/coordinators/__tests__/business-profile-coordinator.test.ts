@@ -1,10 +1,17 @@
 import assert from 'node:assert/strict'
+import { unlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { Readable } from 'node:stream'
 import test from 'node:test'
 
 import { createBusinessCoordinator } from '@client/coordinators/WaBusinessCoordinator'
+import { createNoopLogger } from '@infra/log/types'
+import { WaMediaTransferClient } from '@media/WaMediaTransferClient'
 import { proto } from '@proto'
 import { WA_XMLNS } from '@protocol/constants'
 import type { BinaryNode } from '@transport/types'
+import { TEXT_ENCODER } from '@util/bytes'
 
 function createIqResult(content?: readonly BinaryNode[]): BinaryNode {
     return {
@@ -14,6 +21,20 @@ function createIqResult(content?: readonly BinaryNode[]): BinaryNode {
     }
 }
 
+type CoordinatorDeps = Parameters<typeof createBusinessCoordinator>[0]
+
+function makeBusinessCoordinator(overrides: Partial<CoordinatorDeps> = {}) {
+    return createBusinessCoordinator({
+        queryWithContext: async () => createIqResult(),
+        mediaTransfer: new WaMediaTransferClient(),
+        getMediaConn: () => {
+            throw new Error('getMediaConn not stubbed in this test')
+        },
+        logger: createNoopLogger('error'),
+        ...overrides
+    })
+}
+
 test('business coordinator gets full profile fields', async () => {
     const calls: Array<{
         readonly context: string
@@ -21,7 +42,7 @@ test('business coordinator gets full profile fields', async () => {
         readonly contextData?: Readonly<Record<string, unknown>>
     }> = []
 
-    const coordinator = createBusinessCoordinator({
+    const coordinator = makeBusinessCoordinator({
         queryWithContext: async (context, node, _timeoutMs, contextData) => {
             calls.push({ context, node, contextData })
             return createIqResult([
@@ -142,7 +163,7 @@ test('business coordinator gets full profile fields', async () => {
 })
 
 test('business coordinator returns empty for profile with no children', async () => {
-    const coordinator = createBusinessCoordinator({
+    const coordinator = makeBusinessCoordinator({
         queryWithContext: async () =>
             createIqResult([
                 {
@@ -161,7 +182,7 @@ test('business coordinator returns empty for profile with no children', async ()
 
 test('business coordinator skips query for empty jids', async () => {
     const calls: string[] = []
-    const coordinator = createBusinessCoordinator({
+    const coordinator = makeBusinessCoordinator({
         queryWithContext: async (context) => {
             calls.push(context)
             return createIqResult()
@@ -179,7 +200,7 @@ test('business coordinator edits profile with delta mutation', async () => {
         readonly node: BinaryNode
     }> = []
 
-    const coordinator = createBusinessCoordinator({
+    const coordinator = makeBusinessCoordinator({
         queryWithContext: async (context, node) => {
             calls.push({ context, node })
             return createIqResult()
@@ -224,7 +245,7 @@ test('business coordinator edits profile with delta mutation', async () => {
 test('business coordinator edits profile with empty websites clears them', async () => {
     const calls: Array<{ readonly node: BinaryNode }> = []
 
-    const coordinator = createBusinessCoordinator({
+    const coordinator = makeBusinessCoordinator({
         queryWithContext: async (_ctx, node) => {
             calls.push({ node })
             return createIqResult()
@@ -266,7 +287,7 @@ test('business coordinator gets verified name from certificate', async () => {
         verifiedName: 'My Business Name'
     })
 
-    const coordinator = createBusinessCoordinator({
+    const coordinator = makeBusinessCoordinator({
         queryWithContext: async (context, node, _timeoutMs, contextData) => {
             calls.push({ context, node, contextData })
             return createIqResult([
@@ -313,7 +334,7 @@ test('business coordinator verified name uses attr serial as fallback', async ()
         verifiedName: 'Enterprise Biz'
     })
 
-    const coordinator = createBusinessCoordinator({
+    const coordinator = makeBusinessCoordinator({
         queryWithContext: async () =>
             createIqResult([
                 {
@@ -333,7 +354,7 @@ test('business coordinator verified name uses attr serial as fallback', async ()
 })
 
 test('business coordinator verified name without certificate content', async () => {
-    const coordinator = createBusinessCoordinator({
+    const coordinator = makeBusinessCoordinator({
         queryWithContext: async () =>
             createIqResult([
                 {
@@ -351,7 +372,7 @@ test('business coordinator verified name without certificate content', async () 
 })
 
 test('business coordinator returns null for missing verified name', async () => {
-    const coordinator = createBusinessCoordinator({
+    const coordinator = makeBusinessCoordinator({
         queryWithContext: async () => createIqResult()
     })
 
@@ -359,26 +380,47 @@ test('business coordinator returns null for missing verified name', async () => 
     assert.equal(result, null)
 })
 
-test('business coordinator updates cover photo', async () => {
-    const calls: Array<{
-        readonly context: string
-        readonly node: BinaryNode
-    }> = []
+test('business coordinator uploads cover photo bytes and finalizes via IQ', async () => {
+    const uploadCalls: Array<{ readonly url: string; readonly body: unknown }> = []
+    const iqCalls: Array<{ readonly context: string; readonly node: BinaryNode }> = []
 
-    const coordinator = createBusinessCoordinator({
-        queryWithContext: async (context, node) => {
-            calls.push({ context, node })
-            return createIqResult()
-        }
+    const responseJson = JSON.stringify({
+        fbid: 'photo-123',
+        ts: '1700000000',
+        meta_hmac: 'upload-token-abc'
     })
 
-    await coordinator.updateCoverPhoto('photo-123', '1700000000', 'upload-token-abc')
+    const mediaTransfer = {
+        uploadStream: async (req: { readonly url: string; readonly body: unknown }) => {
+            uploadCalls.push({ url: req.url, body: req.body })
+            return { status: 200, ok: true, headers: {}, body: null, url: req.url }
+        },
+        readResponseBytes: async () => TEXT_ENCODER.encode(responseJson)
+    } as unknown as WaMediaTransferClient
 
-    assert.equal(calls.length, 1)
-    assert.equal(calls[0].context, 'business.updateCoverPhoto')
-    assert.equal(calls[0].node.attrs.type, 'set')
-    const bizProfile = (calls[0].node.content as readonly BinaryNode[])[0]
-    assert.equal(bizProfile.tag, 'business_profile')
+    const coordinator = makeBusinessCoordinator({
+        queryWithContext: async (context, node) => {
+            iqCalls.push({ context, node })
+            return createIqResult()
+        },
+        mediaTransfer,
+        getMediaConn: async () => ({
+            auth: 'auth-token-xyz',
+            hosts: [{ hostname: 'mmg.whatsapp.net', isFallback: false }],
+            expiresAtMs: Date.now() + 60_000
+        })
+    })
+
+    await coordinator.updateCoverPhoto(new Uint8Array([1, 2, 3, 4, 5]))
+
+    assert.equal(uploadCalls.length, 1)
+    assert.match(uploadCalls[0].url, /^https:\/\/mmg\.whatsapp\.net\/pps\/biz-cover-photo\//)
+    assert.match(uploadCalls[0].url, /[?&]auth=auth-token-xyz/)
+    assert.match(uploadCalls[0].url, /[?&]media_id=\d+/)
+
+    assert.equal(iqCalls.length, 1)
+    assert.equal(iqCalls[0].context, 'business.updateCoverPhoto')
+    const bizProfile = (iqCalls[0].node.content as readonly BinaryNode[])[0]
     const coverNode = (bizProfile.content as readonly BinaryNode[])[0]
     assert.equal(coverNode.tag, 'cover_photo')
     assert.equal(coverNode.attrs.op, 'update')
@@ -387,8 +429,71 @@ test('business coordinator updates cover photo', async () => {
     assert.equal(coverNode.attrs.token, 'upload-token-abc')
 })
 
+function makeUploadStub(responseBody: string, status = 200) {
+    const transfer = {
+        uploadStream: async (req: { readonly url: string; readonly body: unknown }) => ({
+            status,
+            ok: status >= 200 && status < 300,
+            headers: {},
+            body: null,
+            url: req.url
+        }),
+        readResponseBytes: async () => TEXT_ENCODER.encode(responseBody)
+    } as unknown as WaMediaTransferClient
+    return makeBusinessCoordinator({
+        queryWithContext: async () => createIqResult(),
+        mediaTransfer: transfer,
+        getMediaConn: async () => ({
+            auth: 'auth',
+            hosts: [{ hostname: 'mmg.whatsapp.net', isFallback: false }],
+            expiresAtMs: Date.now() + 60_000
+        })
+    })
+}
+
+test('updateCoverPhoto throws on missing fields in response', async () => {
+    const coordinator = makeUploadStub(JSON.stringify({ fbid: 'fb-1', ts: '1700000000' }))
+    await assert.rejects(
+        () => coordinator.updateCoverPhoto(new Uint8Array([1, 2, 3])),
+        /missing fbid\/ts\/meta_hmac/
+    )
+})
+
+test('updateCoverPhoto throws on non-2xx status', async () => {
+    const coordinator = makeUploadStub('{}', 500)
+    await assert.rejects(
+        () => coordinator.updateCoverPhoto(new Uint8Array([1])),
+        /failed with status 500/
+    )
+})
+
+test('updateCoverPhoto throws on invalid json body', async () => {
+    const coordinator = makeUploadStub('not-json', 200)
+    await assert.rejects(() => coordinator.updateCoverPhoto(new Uint8Array([1])), /invalid json/)
+})
+
+test('updateCoverPhoto accepts a file path source', async () => {
+    const filePath = join(tmpdir(), `zapo-cover-test-${Date.now()}-${Math.random()}.bin`)
+    await writeFile(filePath, new Uint8Array([10, 20, 30, 40, 50]))
+    try {
+        const coordinator = makeUploadStub(
+            JSON.stringify({ fbid: 'p-1', ts: '1700000000', meta_hmac: 't-1' })
+        )
+        await coordinator.updateCoverPhoto(filePath)
+    } finally {
+        await unlink(filePath).catch(() => undefined)
+    }
+})
+
+test('updateCoverPhoto accepts a Readable source', async () => {
+    const coordinator = makeUploadStub(
+        JSON.stringify({ fbid: 'p-2', ts: '1700000001', meta_hmac: 't-2' })
+    )
+    await coordinator.updateCoverPhoto(Readable.from([new Uint8Array([1, 2, 3, 4])]))
+})
+
 test('business coordinator parses empty description and guards NaN lat/lng', async () => {
-    const coordinator = createBusinessCoordinator({
+    const coordinator = makeBusinessCoordinator({
         queryWithContext: async () =>
             createIqResult([
                 {
@@ -422,7 +527,7 @@ test('business coordinator deletes cover photo', async () => {
         readonly node: BinaryNode
     }> = []
 
-    const coordinator = createBusinessCoordinator({
+    const coordinator = makeBusinessCoordinator({
         queryWithContext: async (context, node) => {
             calls.push({ context, node })
             return createIqResult()
