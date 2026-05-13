@@ -55,6 +55,93 @@ test('BufferedTeeLogger respects bufferLimit by dropping oldest entries', () => 
     )
 })
 
+test('listLogs filters by q substring across message + context', () => {
+    const runtime = new McpRuntime(baseConfig())
+    const logger = runtime.getLogger()
+    logger.info('boot', { sessionId: 'abc' })
+    logger.warn('publish failed', { id: 'XYZ123' })
+    logger.error('publish failed', { id: 'qqq' })
+
+    const byMessage = runtime.listLogs({ q: 'PUBLISH' })
+    assert.equal(byMessage.length, 2)
+
+    const byContext = runtime.listLogs({ q: 'xyz' })
+    assert.equal(byContext.length, 1)
+    assert.equal(byContext[0].message, 'publish failed')
+
+    const none = runtime.listLogs({ q: 'no-such-thing' })
+    assert.equal(none.length, 0)
+})
+
+test('listLogs supports case-insensitive regex via q + regex flag', () => {
+    const runtime = new McpRuntime(baseConfig())
+    const logger = runtime.getLogger()
+    logger.info('order 42 processed')
+    logger.info('order ab processed')
+    logger.error('boom')
+
+    const matches = runtime.listLogs({ q: 'ORDER \\d+', regex: true })
+    assert.equal(matches.length, 1)
+    assert.equal(matches[0].message, 'order 42 processed')
+
+    const malformed = runtime.listLogs({ q: '(unclosed', regex: true })
+    assert.equal(malformed.length, 0)
+})
+
+interface RecordEventCapable {
+    recordEvent: (type: string, payload: unknown) => void
+}
+
+const recordEvent = (runtime: McpRuntime, type: string, payload: unknown): void => {
+    ;(runtime as unknown as RecordEventCapable).recordEvent(type, payload)
+}
+
+test('listEvents filters by q substring across type + payload', () => {
+    const runtime = new McpRuntime(baseConfig())
+    recordEvent(runtime, 'connection', { status: 'open' })
+    recordEvent(runtime, 'message', { chatJid: '120363@g.us', text: 'hi' })
+    recordEvent(runtime, 'message', { chatJid: '5511@s.whatsapp.net', text: 'yo' })
+    recordEvent(runtime, 'group_event', { action: 'add', participants: ['120363@g.us'] })
+
+    const byType = runtime.listEvents({ q: 'CONNECTION' })
+    assert.equal(byType.length, 1)
+    assert.equal(byType[0].type, 'connection')
+
+    const byPayloadJid = runtime.listEvents({ q: '120363' })
+    assert.equal(byPayloadJid.length, 2)
+    assert.deepStrictEqual(
+        byPayloadJid.map((e) => e.type),
+        ['message', 'group_event']
+    )
+
+    const none = runtime.listEvents({ q: 'no-such-thing' })
+    assert.equal(none.length, 0)
+})
+
+test('listEvents supports case-insensitive regex via q + regex flag', () => {
+    const runtime = new McpRuntime(baseConfig())
+    recordEvent(runtime, 'message', { id: '3EB001' })
+    recordEvent(runtime, 'message', { id: '3EB002' })
+    recordEvent(runtime, 'message', { id: 'OTHER' })
+
+    const matches = runtime.listEvents({ q: '3eb0\\d{2}', regex: true })
+    assert.equal(matches.length, 2)
+
+    const malformed = runtime.listEvents({ q: '(unclosed', regex: true })
+    assert.equal(malformed.length, 0)
+})
+
+test('listEvents q combines with types filter', () => {
+    const runtime = new McpRuntime(baseConfig())
+    recordEvent(runtime, 'message', { id: 'AAA-match' })
+    recordEvent(runtime, 'group_event', { id: 'AAA-match' })
+    recordEvent(runtime, 'message', { id: 'BBB' })
+
+    const matches = runtime.listEvents({ types: ['message'], q: 'aaa' })
+    assert.equal(matches.length, 1)
+    assert.equal(matches[0].type, 'message')
+})
+
 test('BufferedTeeLogger mirrors entries to the configured log file as JSONL', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'mcp-log-'))
     const logFilePath = join(dir, 'out.log')

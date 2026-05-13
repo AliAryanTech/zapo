@@ -88,16 +88,22 @@ class BufferedTeeLogger implements Logger {
             readonly since?: number
             readonly limit?: number
             readonly drain?: boolean
+            readonly q?: string
+            readonly regex?: boolean
         } = {}
     ): readonly LogEntry[] {
         const levels = filter.levels && filter.levels.length > 0 ? new Set(filter.levels) : null
         const since = filter.since ?? 0
         const limit = filter.limit && filter.limit > 0 ? filter.limit : 100
+        const matchQuery = buildQueryMatcher(filter.q ?? '', filter.regex === true)
         const matched: LogEntry[] = []
         for (let i = 0; i < this.buffer.length; i += 1) {
             const entry = this.buffer[i]
             if (entry.seq <= since) continue
             if (levels && !levels.has(entry.level)) continue
+            const haystack =
+                entry.message + (entry.context ? ' ' + safeStringify(entry.context) : '')
+            if (!matchQuery(haystack)) continue
             matched.push(entry)
         }
         const tail = matched.length > limit ? matched.slice(matched.length - limit) : matched
@@ -182,6 +188,27 @@ const safeStringify = (value: unknown): string => {
     } catch (err) {
         return JSON.stringify({ $stringifyError: toError(err).message })
     }
+}
+
+/**
+ * Build a predicate for case-insensitive substring search (default) or regex
+ * match (`isRegex: true`, with the `i` flag). Precomputes the lowercased query
+ * or compiles the regex once so the buffer scan does not re-allocate them per
+ * entry. Malformed regex yields a predicate that always returns false instead
+ * of throwing — tool inputs should miss rather than crash the scan.
+ */
+const buildQueryMatcher = (query: string, isRegex: boolean): ((haystack: string) => boolean) => {
+    if (!query) return () => true
+    if (isRegex) {
+        try {
+            const pattern = new RegExp(query, 'i')
+            return (haystack): boolean => pattern.test(haystack)
+        } catch {
+            return () => false
+        }
+    }
+    const lower = query.toLowerCase()
+    return (haystack): boolean => haystack.toLowerCase().includes(lower)
 }
 
 const ALL_EVENT_NAMES = [
@@ -383,6 +410,8 @@ export class McpRuntime {
             readonly since?: number
             readonly limit?: number
             readonly drain?: boolean
+            readonly q?: string
+            readonly regex?: boolean
         } = {}
     ): readonly LogEntry[] {
         return this.logger.listLogs(filter)
@@ -512,16 +541,20 @@ export class McpRuntime {
             readonly since?: number
             readonly limit?: number
             readonly drain?: boolean
+            readonly q?: string
+            readonly regex?: boolean
         } = {}
     ): readonly BufferedEvent[] {
         const types = filter.types && filter.types.length > 0 ? new Set(filter.types) : null
         const since = filter.since ?? 0
         const limit = filter.limit && filter.limit > 0 ? filter.limit : 50
+        const matchQuery = buildQueryMatcher(filter.q ?? '', filter.regex === true)
         const matched: BufferedEvent[] = []
         for (let i = 0; i < this.buffer.length; i += 1) {
             const ev = this.buffer[i]
             if (ev.seq <= since) continue
             if (types && !types.has(ev.type)) continue
+            if (!matchQuery(ev.type + ' ' + safeStringify(ev.payload))) continue
             matched.push(ev)
         }
         const tail = matched.length > limit ? matched.slice(matched.length - limit) : matched
